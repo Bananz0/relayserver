@@ -33,6 +33,8 @@ extern "C" {
     );
     
     fn mg_copy_answer(property: *const c_char) -> *mut c_char;
+    fn mg_get_battery_level() -> c_int;
+    fn mg_is_charging() -> c_int;
 }
 
 pub fn nac_init_rs(cert: &[u8], output: &mut Vec<u8>) -> Result<u64, RelayError> {
@@ -84,5 +86,22 @@ pub fn mg_copy_answer_rs(item: &str) -> String {
         let c_str = CStr::from_ptr(answer).to_str().unwrap().to_string();
         libc::free(answer as *mut c_void);
         c_str
+    }
+}
+
+pub fn get_battery_level_rs() -> Option<i32> {
+    unsafe {
+        let level = mg_get_battery_level();
+        if level >= 0 {
+            Some(level as i32)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn is_charging_rs() -> bool {
+    unsafe {
+        mg_is_charging() != 0
     }
 }

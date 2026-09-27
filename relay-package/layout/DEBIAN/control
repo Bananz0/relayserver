@@ -1,7 +1,6 @@
 Package: dev.copper.relayserver
 Name: relay-package
-Depends: 
-Version: 0.0.1
+Version: 0.0.2
 Architecture: iphoneos-arm
 Description: A background server
 Maintainer: Tae Hagen

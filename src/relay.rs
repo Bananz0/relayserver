@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, select, sync::Mutex, task::JoinHandle, time::{self, Instant}};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::{base64_encode, c::mg_copy_answer_rs, error::RelayError, nac::generate_validation_data, util::{Resource, ResourceManager}};
+use crate::{base64_encode, c::mg_copy_answer_rs, error::RelayError, homeassistant::RelayMetrics, nac::generate_validation_data, util::{Resource, ResourceManager}};
 
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -19,6 +19,7 @@ pub struct RelayState {
 pub struct RelayResource {
     pub url: Mutex<String>,
     pub state: Mutex<Option<RelayState>>,
+    pub metrics: Arc<RelayMetrics>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,27 +81,37 @@ impl Resource for RelayResource {
 
         ws_stream.send(RelayCommand { id: None, command: "register".to_string(), data: Some(mapped)}.to_message()).await?;
 
-        let item: RelayCommand = serde_json::from_str(&ws_stream.next().await.unwrap()?.into_text()?)?;
-        let Some(CommandData::Code { code }) = item.data else { panic!("bad response!") };
+        let next_msg = ws_stream.next().await.ok_or_else(|| RelayError::ResourcePanic("WebSocket stream closed prematurely".to_string()))??;
+        let item: RelayCommand = serde_json::from_str(&next_msg.into_text()?)?;
+        let Some(CommandData::Code { code }) = item.data else {
+            return Err(RelayError::ResourcePanic("Invalid registration response from server".to_string()));
+        };
 
         println!("Connected with code {}", code.code);
 
+        self.metrics.set_code(&code.code);
+        self.metrics.set_connected(true);
+
         *state = Some(code);
 
-
+        let metrics = self.metrics.clone();
         Ok(tokio::spawn(async move {
-            match RelayResource::poll(ws_stream).await {
-                Ok(_) => {},
+            match RelayResource::poll(ws_stream, metrics.clone()).await {
+                Ok(_) => {
+                    println!("[Relay] WebSocket connection closed normally. Waiting 3s before reconnecting...");
+                },
                 Err(err) => {
-                    println!("error {err}");
+                    println!("[Relay] WebSocket error: {err}. Waiting 3s before reconnecting...");
                 }
             }
+            metrics.set_connected(false);
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }))
     }
 }
 
 impl RelayResource {
-    async fn poll(mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<(), RelayError> {
+    async fn poll(mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>, metrics: Arc<RelayMetrics>) -> Result<(), RelayError> {
         let ping_interval = Duration::from_secs(60);
         let mut last_ping = Instant::now();
         loop {
@@ -115,7 +126,13 @@ impl RelayResource {
                         }
                     };
                     
-                    let command: RelayCommand = serde_json::from_str(&msg).unwrap();
+                    let command: RelayCommand = match serde_json::from_str(&msg) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Failed to parse WebSocket JSON '{msg}': {e}");
+                            continue;
+                        }
+                    };
                     match command.command.as_str() {
                         "get-version-info" => {
                             let uts = uname().unwrap();
@@ -129,12 +146,31 @@ impl RelayResource {
                             } })).await?;
                         },
                         "get-validation-data" => {
-                            println!("Generating validation data!");
-                            ws_stream.send(command.respond(CommandData::ValidationData { data: base64_encode(&generate_validation_data().await?) })).await?;
-                            println!("Sent validation data!");
+                            println!("Received get-validation-data request from client!");
+                            match generate_validation_data().await {
+                                Ok(val_bytes) => {
+                                    metrics.record_validation();
+                                    println!("Validation data generated successfully ({} bytes)!", val_bytes.len());
+                                    let resp = command.respond(CommandData::ValidationData {
+                                        data: base64_encode(&val_bytes),
+                                    });
+                                    if let Err(e) = ws_stream.send(resp).await {
+                                        eprintln!("Failed to send validation data response over WebSocket: {e}");
+                                    } else {
+                                        println!("Sent validation data response to Beeper!");
+                                    }
+                                }
+                                Err(e) => {
+                                    metrics.record_error(&format!("{e:?}"));
+                                    eprintln!("ERROR generating validation data: {e:?}");
+                                    // Do NOT drop ws_stream! OpenBubbles will be able to retry or inspect logs.
+                                }
+                            }
                         },
                         "pong" => {},
-                        _raw => panic!("bad command {_raw}"),
+                        _raw => {
+                            println!("Unhandled command from relay: {_raw}");
+                        },
                     }
                 },
                 _ = time::sleep_until(last_ping + ping_interval) => {
@@ -150,10 +186,11 @@ impl RelayResource {
         Ok(())
     }
 
-    pub fn new(url: String, state: Option<RelayState>) -> Relay {
+    pub fn new(url: String, state: Option<RelayState>, metrics: Arc<RelayMetrics>) -> Relay {
         let resource = RelayResource {
             url: Mutex::new(url),
             state: Mutex::new(state),
+            metrics,
         };
 
         ResourceManager::new(
