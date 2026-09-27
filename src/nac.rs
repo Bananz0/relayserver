@@ -32,23 +32,30 @@ pub fn plist_to_buf<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
 }
 
 pub async fn generate_validation_data() -> Result<Vec<u8>, RelayError> {
-    println!("[NAC] Step 1: Building HTTP client...");
+    println!("[NAC] Step 1: Building HTTP client with timeouts...");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .use_rustls_tls()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| {
             eprintln!("[NAC] Error creating HTTP client: {e}");
             e
         })?;
 
-    println!("[NAC] Step 2: Fetching Apple validation certificate from http://static.ess.apple.com/identity/validation/cert-1.0.plist ...");
-    let key = client.get("http://static.ess.apple.com/identity/validation/cert-1.0.plist")
-        .send().await
-        .map_err(|e| {
-            eprintln!("[NAC] Error fetching cert-1.0.plist: {e}");
-            e
-        })?;
+    println!("[NAC] Step 2: Fetching Apple validation certificate...");
+    let cert_url = "https://static.ess.apple.com/identity/validation/cert-1.0.plist";
+    let key = match client.get(cert_url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            println!("[NAC] HTTPS cert fetch failed ({e}). Falling back to HTTP...");
+            client.get("http://static.ess.apple.com/identity/validation/cert-1.0.plist").send().await.map_err(|e| {
+                eprintln!("[NAC] Error fetching cert-1.0.plist: {e}");
+                e
+            })?
+        }
+    };
     let key_bytes = key.bytes().await.map_err(|e| {
         eprintln!("[NAC] Error reading cert bytes: {e}");
         e

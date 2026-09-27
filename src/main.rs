@@ -70,6 +70,25 @@ fn urlencoding_decode(s: &str) -> String {
     result
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\'', "&#39;")
+}
+
+fn save_config_atomic(path: &str, content: &str) -> std::io::Result<()> {
+    let tmp_path = format!("{}.tmp", path);
+    let bak_path = format!("{}.bak", path);
+    std::fs::write(&tmp_path, content)?;
+    if std::path::Path::new(path).exists() {
+        let _ = std::fs::copy(path, &bak_path);
+    }
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let config_path = if std::path::Path::new("/var/mobile").exists() {
@@ -171,9 +190,9 @@ async fn main() {
 
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 4096];
-                let n = match socket.read(&mut buf).await {
-                    Ok(n) if n > 0 => n,
+                let mut buf = [0u8; 8192];
+                let n = match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => n,
                     _ => return,
                 };
                 let req_str = String::from_utf8_lossy(&buf[..n]);
@@ -196,7 +215,14 @@ async fn main() {
                 let (status, content_type, body) = if path == "/code" {
                     ("200 OK", "text/plain; charset=utf-8".to_string(), code_val)
                 } else if path == "/json" {
-                    ("200 OK", "application/json".to_string(), serde_json::to_string_pretty(&state).unwrap_or_default())
+                    let mut safe_state = state.clone();
+                    if let Some(ref mut ha) = safe_state.homeassistant {
+                        ha.token = "********".to_string();
+                    }
+                    if let Some(ref mut s) = safe_state.state {
+                        s.secret = "********".to_string();
+                    }
+                    ("200 OK", "application/json".to_string(), serde_json::to_string_pretty(&safe_state).unwrap_or_default())
                 } else if path == "/ha" || path == "/metrics" {
                     let ha_payload = generate_ha_payload(&metrics);
                     ("200 OK", "application/json".to_string(), serde_json::to_string_pretty(&ha_payload).unwrap_or_default())
@@ -236,11 +262,10 @@ async fn main() {
 
                         *ha_config.write().await = Some(new_ha.clone());
 
-                        // Persist to config.json
+                        // Persist to config.json atomically
                         let updated_state = RelayConfig::from_relay(&relay, Some(new_ha.clone())).await;
                         if let Ok(json_str) = serde_json::to_string_pretty(&updated_state) {
-                            let _ = std::fs::write(&config_path, &json_str);
-                            let _ = std::fs::write("/var/mobile/Media/config.json", &json_str);
+                            let _ = save_config_atomic(&config_path, &json_str);
                         }
 
                         // Immediate test push
@@ -252,7 +277,7 @@ async fn main() {
 
                         ("200 OK", "text/html; charset=utf-8".to_string(), format!(
                             "<!DOCTYPE html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='2;url=/'><style>body{{font-family:sans-serif;background:#121212;color:#fff;text-align:center;padding:40px;}}a{{color:#30d158;}}</style></head><body><h2>{}</h2><p>Redirecting back to dashboard in 2s... <a href='/'>Go back</a></p></body></html>",
-                            push_msg
+                            html_escape(&push_msg)
                         ))
                     } else {
                         ("400 Bad Request", "text/plain; charset=utf-8".to_string(), "Missing url or token parameter.".to_string())
@@ -293,10 +318,33 @@ async fn main() {
                     });
                     let ha_url_val = ha_current.as_ref().map(|c| c.url.clone()).unwrap_or_default();
                     let ha_entity_val = ha_current.as_ref().map(|c| c.entity_id.clone()).unwrap_or_else(|| "sensor.openbubbles_relay".to_string());
+                    let device_name = {
+                        let prod = c::mg_copy_answer_rs("ProductType");
+                        if !prod.is_empty() { prod } else { "iOS Device".to_string() }
+                    };
+                    let ios_ver = {
+                        let v = c::mg_copy_answer_rs("ProductVersion");
+                        if !v.is_empty() { v } else { "10.3.3".to_string() }
+                    };
+                    let conn_badge = if metrics.is_connected() {
+                        "<b style='color:#30d158;'>Online</b>"
+                    } else {
+                        "<b style='color:#ff9f0a;'>Connecting...</b>"
+                    };
 
                     let html = format!(
-                        "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>OpenBubbles Relay</title><style>body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; margin: 0; }} .card {{ background: #1e1e1e; border-radius: 16px; padding: 20px; max-width: 520px; margin: 16px auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); text-align: left; }} .label {{ font-size: 13px; text-transform: uppercase; color: #888; letter-spacing: 1px; font-weight: bold; margin-bottom: 8px; }} .code {{ font-family: monospace; font-size: 28px; font-weight: bold; color: #30d158; background: #000; padding: 12px; border-radius: 10px; margin: 12px 0; text-align: center; word-break: break-all; user-select: all; }} .badge-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }} .badge {{ background: #2c2c2e; padding: 6px 12px; border-radius: 8px; font-size: 12px; color: #ccc; }} .badge b {{ color: #fff; }} .btn {{ display: inline-block; padding: 10px 14px; margin: 4px 2px; background: #2c2c2e; color: #0a84ff; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 13px; text-align: center; border: none; cursor: pointer; }} .btn:hover {{ background: #3a3a3c; }} .btn-green {{ background: #30d158; color: #000; font-weight: bold; }} .btn-green:hover {{ background: #28b84d; }} input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; background: #000; border: 1px solid #333; color: #fff; padding: 10px; border-radius: 8px; font-size: 14px; margin: 6px 0 12px 0; }}</style></head><body><div class='card'><div class='label'>OpenBubbles Relay Code</div><div class='code'>{}</div><div class='badge-row'><div class='badge'>Device: <b>iPhone 5c (iOS 10.3.3)</b></div><div class='badge'>IP: <b>{}</b></div><div class='badge'>Battery: <b>{}{}</b></div><div class='badge'>Validations: <b>{} completed</b></div><div class='badge'>Relay: <b style='color:#30d158;'>Online</b></div></div><p style='font-size:12px;color:#888;margin:6px 0;'>Saved to: <code>/var/mobile/config.json</code></p></div><div class='card'><div class='label'>Home Assistant Integration</div><p style='font-size:13px;color:#aaa;margin-top:0;'>Your phone automatically reports its IP, battery, relay code, and health to Home Assistant every 60s so you can plug it in anywhere and forget about it.</p><div class='badge' style='margin-bottom:12px;'>Status: <b>{}</b></div><form action='/ha/save' method='POST'><label style='font-size:12px;color:#aaa;'>Home Assistant URL</label><input type='text' name='url' placeholder='http://homeassistant.local:8123 or http://192.168.0.x:8123' value='{}' required><label style='font-size:12px;color:#aaa;'>Long-Lived Access Token (from HA Profile &rarr; Long-Lived Access Tokens)</label><input type='password' name='token' placeholder='eyJhbGciOi...' required><label style='font-size:12px;color:#aaa;'>Entity ID</label><input type='text' name='entity_id' value='{}' required><button type='submit' class='btn btn-green' style='width:100%;padding:12px;margin:8px 0;'>Save &amp; Send Test Update to Home Assistant</button></form></div><div class='card'><div class='label'>Tools &amp; Diagnostics</div><div style='margin-top:8px;'><a class='btn' href='/test-nac' target='_blank'>&rarr; Test Apple NAC Validation</a><a class='btn' href='/ha/test' target='_blank'>Test HA Push</a><a class='btn' href='/ha' target='_blank'>HA JSON API (/ha)</a><a class='btn' href='/log' target='_blank'>Live Log</a><a class='btn' href='/err' target='_blank'>Error Log</a><a class='btn' href='/json' target='_blank'>Config JSON</a><a class='btn' href='/restart'>Restart Daemon</a></div></div></body></html>",
-                        code_val, local_ip, bat, charging, val_count, ha_status, ha_url_val, ha_entity_val
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>OpenBubbles Relay</title><style>body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; margin: 0; }} .card {{ background: #1e1e1e; border-radius: 16px; padding: 20px; max-width: 520px; margin: 16px auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); text-align: left; }} .label {{ font-size: 13px; text-transform: uppercase; color: #888; letter-spacing: 1px; font-weight: bold; margin-bottom: 8px; }} .code {{ font-family: monospace; font-size: 28px; font-weight: bold; color: #30d158; background: #000; padding: 12px; border-radius: 10px; margin: 12px 0; text-align: center; word-break: break-all; user-select: all; }} .badge-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }} .badge {{ background: #2c2c2e; padding: 6px 12px; border-radius: 8px; font-size: 12px; color: #ccc; }} .badge b {{ color: #fff; }} .btn {{ display: inline-block; padding: 10px 14px; margin: 4px 2px; background: #2c2c2e; color: #0a84ff; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 13px; text-align: center; border: none; cursor: pointer; }} .btn:hover {{ background: #3a3a3c; }} .btn-green {{ background: #30d158; color: #000; font-weight: bold; }} .btn-green:hover {{ background: #28b84d; }} input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; background: #000; border: 1px solid #333; color: #fff; padding: 10px; border-radius: 8px; font-size: 14px; margin: 6px 0 12px 0; }}</style></head><body><div class='card'><div class='label'>OpenBubbles Relay Code</div><div class='code'>{}</div><div class='badge-row'><div class='badge'>Device: <b>{} (iOS {})</b></div><div class='badge'>IP: <b>{}</b></div><div class='badge'>Battery: <b>{}{}</b></div><div class='badge'>Validations: <b>{} completed</b></div><div class='badge'>Relay: {}</div></div><p style='font-size:12px;color:#888;margin:6px 0;'>Saved to: <code>/var/mobile/config.json</code></p></div><div class='card'><div class='label'>Home Assistant Integration</div><p style='font-size:13px;color:#aaa;margin-top:0;'>Your phone automatically reports its IP, battery, relay code, and health to Home Assistant every 60s so you can plug it in anywhere and forget about it.</p><div class='badge' style='margin-bottom:12px;'>Status: <b>{}</b></div><form action='/ha/save' method='POST'><label style='font-size:12px;color:#aaa;'>Home Assistant URL</label><input type='text' name='url' placeholder='http://homeassistant.local:8123 or http://192.168.0.x:8123' value='{}' required><label style='font-size:12px;color:#aaa;'>Long-Lived Access Token (from HA Profile &rarr; Long-Lived Access Tokens)</label><input type='password' name='token' placeholder='eyJhbGciOi...' required><label style='font-size:12px;color:#aaa;'>Entity ID</label><input type='text' name='entity_id' value='{}' required><button type='submit' class='btn btn-green' style='width:100%;padding:12px;margin:8px 0;'>Save &amp; Send Test Update to Home Assistant</button></form></div><div class='card'><div class='label'>Tools &amp; Diagnostics</div><div style='margin-top:8px;'><a class='btn' href='/test-nac' target='_blank'>&rarr; Test Apple NAC Validation</a><a class='btn' href='/ha/test' target='_blank'>Test HA Push</a><a class='btn' href='/ha' target='_blank'>HA JSON API (/ha)</a><a class='btn' href='/log' target='_blank'>Live Log</a><a class='btn' href='/err' target='_blank'>Error Log</a><a class='btn' href='/json' target='_blank'>Config JSON</a><a class='btn' href='/restart'>Restart Daemon</a></div></div></body></html>",
+                        html_escape(&code_val),
+                        html_escape(&device_name),
+                        html_escape(&ios_ver),
+                        html_escape(&local_ip),
+                        html_escape(&bat),
+                        charging,
+                        val_count,
+                        conn_badge,
+                        html_escape(&ha_status),
+                        html_escape(&ha_url_val),
+                        html_escape(&ha_entity_val)
                     );
                     ("200 OK", "text/html; charset=utf-8".to_string(), html)
                 };
@@ -321,12 +369,11 @@ async fn main() {
                     let Some(conn) = reconn_conn.upgrade() else { break };
                     let ha_curr = reconn_ha_config.read().await.clone();
                     let state = RelayConfig::from_relay(&conn, ha_curr).await;
-                    let json_data = serde_json::to_string(&state).unwrap();
+                    let json_data = serde_json::to_string_pretty(&state).unwrap_or_default();
                     println!("Relay updated! Writing to {}", config_path);
-                    if let Err(e) = std::fs::write(config_path, &json_data) {
+                    if let Err(e) = save_config_atomic(config_path, &json_data) {
                         eprintln!("Failed to write to {}: {}", config_path, e);
                     }
-                    let _ = std::fs::write("/var/mobile/Media/config.json", &json_data);
                 },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,

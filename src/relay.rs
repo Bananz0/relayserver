@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::{Duration, SystemTime}};
+use std::{sync::Arc, time::Duration};
 
 use backon::ExponentialBuilder;
 use futures::{SinkExt, StreamExt};
@@ -57,13 +57,13 @@ struct RelayCommand {
 
 impl RelayCommand {
     fn to_message(self) -> Message {
-        Message::Text(serde_json::to_string(&self).unwrap())
+        Message::Text(serde_json::to_string(&self).unwrap_or_default())
     }
 
     fn respond(&self, data: CommandData) -> Message {
         RelayCommand {
             command: "response".to_string(),
-            id: Some(self.id.unwrap()),
+            id: self.id,
             data: Some(data)
         }.to_message()
     }
@@ -113,15 +113,32 @@ impl Resource for RelayResource {
 impl RelayResource {
     async fn poll(mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>, metrics: Arc<RelayMetrics>) -> Result<(), RelayError> {
         let ping_interval = Duration::from_secs(60);
+        let max_idle = Duration::from_secs(180);
         let mut last_ping = Instant::now();
+        let mut last_activity = Instant::now();
         loop {
             select! {
                 msg = ws_stream.next() => {
-                    let Some(msg) = msg else { continue };
+                    let Some(msg) = msg else {
+                        println!("[Relay] WebSocket stream ended by server. Reconnecting...");
+                        break;
+                    };
                     let msg = match msg {
-                        Ok(Message::Text(msg)) => msg,
-                        _msg => {
-                            println!("Bad msg! {_msg:?}!");
+                        Ok(Message::Text(msg)) => {
+                            last_activity = Instant::now();
+                            msg
+                        },
+                        Ok(Message::Ping(_) | Message::Pong(_)) => {
+                            last_activity = Instant::now();
+                            continue;
+                        },
+                        Ok(Message::Close(_)) => {
+                            println!("[Relay] Server sent WebSocket Close frame.");
+                            break;
+                        },
+                        Ok(_) => continue,
+                        Err(e) => {
+                            println!("[Relay] WebSocket stream error: {e}");
                             break;
                         }
                     };
@@ -135,9 +152,12 @@ impl RelayResource {
                     };
                     match command.command.as_str() {
                         "get-version-info" => {
-                            let uts = uname().unwrap();
+                            let machine_str = match uname() {
+                                Ok(uts) => uts.machine().to_str().unwrap_or("iPhone").to_string(),
+                                Err(_) => "iPhone".to_string(),
+                            };
                             ws_stream.send(command.respond(CommandData::Versions { versions: RelayVersions {
-                                hardware_version: uts.machine().to_str().unwrap().to_string(),
+                                hardware_version: machine_str,
                                 software_name: "iPhone OS".to_string(),
                                 software_version: mg_copy_answer_rs("ProductVersion"),
                                 software_build_id: mg_copy_answer_rs("BuildVersion"),
@@ -163,22 +183,32 @@ impl RelayResource {
                                 Err(e) => {
                                     metrics.record_error(&format!("{e:?}"));
                                     eprintln!("ERROR generating validation data: {e:?}");
-                                    // Do NOT drop ws_stream! OpenBubbles will be able to retry or inspect logs.
+                                    let err_resp = command.respond(CommandData::Empty {});
+                                    let _ = ws_stream.send(err_resp).await;
                                 }
                             }
                         },
-                        "pong" => {},
+                        "pong" => {
+                            last_activity = Instant::now();
+                        },
                         _raw => {
                             println!("Unhandled command from relay: {_raw}");
                         },
                     }
                 },
                 _ = time::sleep_until(last_ping + ping_interval) => {
-                    ws_stream.send(RelayCommand {
+                    if last_activity.elapsed() > max_idle {
+                        println!("[Relay] No response/activity from server in {:?}. Forcing reconnect...", max_idle);
+                        break;
+                    }
+                    if let Err(e) = ws_stream.send(RelayCommand {
                         command: "ping".to_string(),
                         id: None,
                         data: None,
-                    }.to_message()).await?;
+                    }.to_message()).await {
+                        eprintln!("[Relay] Failed to send WebSocket ping: {e}");
+                        break;
+                    }
                     last_ping = Instant::now();
                 }
             }

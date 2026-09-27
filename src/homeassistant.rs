@@ -49,12 +49,12 @@ impl RelayMetrics {
     }
 
     pub fn set_code(&self, code: &str) {
-        *self.relay_code.write().unwrap() = code.to_string();
+        *self.relay_code.write().unwrap_or_else(|p| p.into_inner()) = code.to_string();
         let _ = self.ha_trigger.send(());
     }
 
     pub fn get_code(&self) -> String {
-        self.relay_code.read().unwrap().clone()
+        self.relay_code.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn set_connected(&self, conn: bool) {
@@ -69,21 +69,21 @@ impl RelayMetrics {
     pub fn record_validation(&self) {
         let count = self.validations_completed.fetch_add(1, Ordering::SeqCst) + 1;
         let now_str = format!("Validation #{} at +{:.0}s", count, self.start_time.elapsed().as_secs());
-        *self.last_validation_time.write().unwrap() = Some(now_str);
+        *self.last_validation_time.write().unwrap_or_else(|p| p.into_inner()) = Some(now_str);
         let _ = self.ha_trigger.send(());
     }
 
     pub fn record_error(&self, err: &str) {
-        *self.last_error.write().unwrap() = Some(err.to_string());
+        *self.last_error.write().unwrap_or_else(|p| p.into_inner()) = Some(err.to_string());
         let _ = self.ha_trigger.send(());
     }
 
     pub fn set_push_status(&self, status: &str) {
-        *self.ha_last_push_status.write().unwrap() = Some(status.to_string());
+        *self.ha_last_push_status.write().unwrap_or_else(|p| p.into_inner()) = Some(status.to_string());
     }
 
     pub fn get_push_status(&self) -> Option<String> {
-        self.ha_last_push_status.read().unwrap().clone()
+        self.ha_last_push_status.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
@@ -106,8 +106,23 @@ pub fn generate_ha_payload(metrics: &RelayMetrics) -> serde_json::Value {
     let code = metrics.get_code();
     let is_online = metrics.is_connected();
     let validations = metrics.validations_completed.load(Ordering::Relaxed);
-    let last_val = metrics.last_validation_time.read().unwrap().clone();
-    let last_err = metrics.last_error.read().unwrap().clone();
+    let last_val = metrics.last_validation_time.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let last_err = metrics.last_error.read().unwrap_or_else(|p| p.into_inner()).clone();
+
+    let device_model = {
+        let prod_type = crate::c::mg_copy_answer_rs("ProductType");
+        if !prod_type.is_empty() {
+            prod_type
+        } else if let Ok(uts) = nix::sys::utsname::uname() {
+            uts.machine().to_str().unwrap_or("iPhone").to_string()
+        } else {
+            "iPhone".to_string()
+        }
+    };
+    let ios_version = {
+        let ver = crate::c::mg_copy_answer_rs("ProductVersion");
+        if !ver.is_empty() { ver } else { "iOS".to_string() }
+    };
 
     serde_json::json!({
         "state": if is_online { "Online" } else { "Connecting" },
@@ -121,8 +136,8 @@ pub fn generate_ha_payload(metrics: &RelayMetrics) -> serde_json::Value {
             "last_validation": last_val.unwrap_or_else(|| "None yet".to_string()),
             "battery_level": battery,
             "battery_charging": charging,
-            "device_model": "iPhone 5c (32-bit armv7s)",
-            "ios_version": "10.3.3",
+            "device_model": device_model,
+            "ios_version": ios_version,
             "ip_address": local_ip,
             "web_ui": format!("http://{}:8080", local_ip),
             "uptime_seconds": uptime,
@@ -138,7 +153,11 @@ pub async fn push_to_homeassistant(
     metrics: &RelayMetrics,
 ) -> Result<String, String> {
     let base_url = config.url.trim_end_matches('/');
-    let endpoint = format!("{}/api/states/{}", base_url, config.entity_id);
+    let clean_entity: String = config.entity_id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    let entity_id = if clean_entity.is_empty() { "sensor.openbubbles_relay" } else { &clean_entity };
+    let endpoint = format!("{}/api/states/{}", base_url, entity_id);
     let payload = generate_ha_payload(metrics);
     let body_str = serde_json::to_string(&payload).map_err(|e| format!("JSON serialize error: {e}"))?;
     let req = client

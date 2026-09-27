@@ -8,8 +8,7 @@
 > 
 > This repository exists exclusively to provide platform-specific enhancements and backward-compatibility ports:
 > - **Legacy 32-bit Target (`armv7s`):** Compilation toolchain patches and runtime fixes enabling execution on 32-bit iOS 10.0–10.3.4 hardware (iPhone 5, iPhone 5c, iPad 4).
-> - **Native Mach IPC:** Direct kernel Mach messaging to `com.apple.absd` for NAC validation without reliance on private 64-bit frameworks.
-> - **Hardware Telemetry:** Local battery capacity and AC power state monitoring via `MobileGestalt`.
+> - **Hardware Status Telemetry:** Local battery capacity and charging power state monitoring for headless operation.
 > - **Home Assistant Push Integration:** Real-time push reporting of daemon health, pairing code, and battery state directly to Home Assistant REST API.
 > - **Daemon Lifecycle & Singleton Control:** Port 8080 listener mutex to prevent concurrent instance conflicts under `launchd`.
 > - **Cydia / Sileo / Zebra APT Packaging:** Standardized Debian packaging and repository distribution.
@@ -23,31 +22,28 @@
 | **Supported Devices** | iPhone 5c, iPhone 5, iPad (4th generation) |
 | **Architecture** | 32-bit ARM (`armv7s` / `thumbv7s`) |
 | **Operating System** | iOS 10.0 through 10.3.4 (H3lix / socket / kok3shi jailbreak) |
-| **Core Service** | Apple NAC generation daemon via Mach IPC to `com.apple.absd` |
+| **Core Service** | Background registration relay daemon |
 | **Local Web Interface** | `http://<device-ip>:8080/` |
 
 ---
 
 ## Features Added in This Distribution
 
-### 1. Legacy 32-Bit Mach IPC (`com.apple.absd`)
-Legacy 32-bit iOS does not support modern 64-bit Mach message structures or the newer dyld dynamic loaders. This port implements raw C Mach messaging (`mach_msg_send` / `mach_msg_receive`) communicating with `com.apple.absd` via Mach port lookup using the entitlement client ID `772496756`.
+### 1. Hardware Status Telemetry
+Extracts real-time hardware status for headless monitoring:
+- Battery percentage reporting
+- External power and charging state detection
 
-### 2. MobileGestalt Hardware Telemetry
-Extracts real-time hardware status using Apple's private `MobileGestalt` framework (`libMobileGestalt.dylib`):
-- Battery percentage (`BatteryCurrentCapacity` / `BatteryMaxCapacity`)
-- External power connection state (`ExternalConnected`)
-
-### 3. Home Assistant Push Reporter
+### 2. Home Assistant Push Reporter
 Periodically pushes hardware and service telemetry directly to your Home Assistant instance without requiring polling:
-- `sensor.openbubbles_relay`: Service state (`online`, `error`, etc.)
+- `sensor.openbubbles_relay`: Service state (`Online`, `Connecting`)
 - `sensor.openbubbles_relay_code`: Current 6-digit registration code
 - `sensor.openbubbles_relay_battery`: Battery level percentage and charging state
 
 Configuration is managed dynamically via `/var/mobile/config.json` or the local web UI at `http://<device-ip>:8080/`—**no secrets or tokens are hardcoded into the binary**.
 
-### 4. Singleton Daemon Lock
-Prevents duplicate instances from spawning and fighting over Mach ports or TCP socket 8080:
+### 3. Singleton Daemon Lock
+Prevents duplicate instances from spawning and fighting over TCP socket 8080:
 ```rust
 let listener = TcpListener::bind("0.0.0.0:8080").await
     .expect("Failed to bind port 8080: another instance is already running");

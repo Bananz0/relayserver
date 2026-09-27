@@ -81,9 +81,15 @@ pub fn nac_sign_rs(ctx: u64, data: &[u8]) -> Result<Vec<u8>, RelayError> {
 
 pub fn mg_copy_answer_rs(item: &str) -> String {
     unsafe {
-        let c_str = CString::new(item).unwrap();
+        let c_str = match CString::new(item) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
         let answer = mg_copy_answer(c_str.as_ptr());
-        let c_str = CStr::from_ptr(answer).to_str().unwrap().to_string();
+        if answer.is_null() {
+            return String::new();
+        }
+        let c_str = CStr::from_ptr(answer).to_string_lossy().into_owned();
         libc::free(answer as *mut c_void);
         c_str
     }
