@@ -808,7 +808,7 @@ dependencies = [
 [[package]]
 name = "ring"
 version = "0.17.8"
-source = "git+https://github.com/Bananz0/ring.git?branch=0.17-armv7s#2f48825924ba358572cb3cb6f5fb6db40dcc0987"
+source = "git+https://github.com/Bananz0/ring.git?branch=0.17-armv7s#46d9c1fbbd7d354afd5d5ae92fd58bdc705fd006"
 dependencies = [
  "cc",
  "cfg-if",
