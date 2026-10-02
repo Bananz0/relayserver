@@ -1,5 +1,193 @@
 #!/bin/sh
-if [ -f /Library/LaunchDaemons/dev.copper.relayserver.plist ]; then
-    launchctl load /Library/LaunchDaemons/dev.copper.relayserver.plist 2>/dev/null || true
+
+killall -9 relayserver 2>/dev/null || true
+sleep 1
+
+is_arm64() {
+    case "$(uname -v 2>/dev/null)" in
+        *ARM64*) return 0 ;;
+    esac
+    [ "$(sysctl -n hw.cpu64bit_capable 2>/dev/null)" = "1" ]
+}
+
+# --- SSH host keys ---------------------------------------------------------------------
+# Releases 0.0.6 - 0.0.16-1 shipped ready-made SSH host keys inside the package and copied
+# them to /etc/ssh. Those private keys are in a public repository, so a device still using
+# one of them gets fresh keys generated on the device. The list below holds the public
+# halves of every key that was ever shipped; nothing secret is stored here.
+KEYDIR=/etc/ssh
+KEYGEN_TIMEOUT=60
+SSH_WARNING=""
+
+is_published_key() {
+    grep -qxF "$1" << 'PUBLISHED_KEYS'
+@@PUBLISHED_KEYS@@
+PUBLISHED_KEYS
+}
+
+# Succeeds if any host key in $KEYDIR is one of the published ones.
+uses_published_key() {
+    for pub in "$KEYDIR"/ssh_host_*_key.pub; do
+        [ -f "$pub" ] || continue
+        read -r _type blob _rest < "$pub" || true
+        [ -n "$blob" ] && is_published_key "$blob" && return 0
+    done
+    return 1
+}
+
+has_host_key() {
+    for key in "$KEYDIR"/ssh_host_*_key; do
+        [ -s "$key" ] && return 0
+    done
+    return 1
+}
+
+# ssh-keygen can hang for good on low-entropy 32-bit devices, so it runs under a watchdog.
+run_keygen() {
+    kg_type=$1
+    kg_file=$2
+    shift 2
+    ssh-keygen -q -t "$kg_type" "$@" -N "" -f "$kg_file" < /dev/null > /dev/null 2>&1 &
+    kg_pid=$!
+    kg_waited=0
+    while kill -0 "$kg_pid" 2>/dev/null; do
+        if [ "$kg_waited" -ge "$KEYGEN_TIMEOUT" ]; then
+            kill -9 "$kg_pid" 2>/dev/null
+            wait "$kg_pid" 2>/dev/null
+            rm -f "$kg_file" "$kg_file.pub"
+            return 1
+        fi
+        sleep 1
+        kg_waited=$((kg_waited + 1))
+    done
+    wait "$kg_pid" && [ -s "$kg_file" ] && [ -s "$kg_file.pub" ]
+}
+
+# Generates new keys next to the old ones and only swaps them in once at least one exists,
+# so a failed run never leaves the device without host keys.
+regenerate_host_keys() {
+    command -v ssh-keygen > /dev/null 2>&1 || return 1
+    new_dir="$KEYDIR/.relay_newkeys"
+    rm -rf "$new_dir"
+    mkdir -p "$new_dir" || return 1
+    made=0
+    run_keygen ed25519 "$new_dir/ssh_host_ed25519_key" && made=1
+    run_keygen ecdsa "$new_dir/ssh_host_ecdsa_key" && made=1
+    run_keygen rsa "$new_dir/ssh_host_rsa_key" -b 2048 && made=1
+    if [ "$made" != "1" ]; then
+        rm -rf "$new_dir"
+        return 1
+    fi
+    for pub in "$KEYDIR"/ssh_host_*_key.pub; do
+        [ -f "$pub" ] || continue
+        read -r _type blob _rest < "$pub" || true
+        if [ -n "$blob" ] && is_published_key "$blob"; then
+            rm -f "$pub" "${pub%.pub}"
+        fi
+    done
+    mv -f "$new_dir"/ssh_host_* "$KEYDIR"/
+    rm -rf "$new_dir"
+    chmod 0600 "$KEYDIR"/ssh_host_*_key 2>/dev/null || true
+    chmod 0644 "$KEYDIR"/ssh_host_*_key.pub 2>/dev/null || true
+    chown root:wheel "$KEYDIR"/ssh_host_* 2>/dev/null || true
+    return 0
+}
+
+if ! is_arm64; then
+    # 32-bit / iOS 10 OpenSSH workarounds: the stock keygen wrapper tries to create a legacy
+    # rsa1 key on every connection and hangs, which freezes SSH.
+    killall -9 sshd ssh-keygen 2>/dev/null || true
+    mkdir -p "$KEYDIR" /var/empty
+    chmod 0755 /var/empty 2>/dev/null || true
+    chown root:sys /var/empty 2>/dev/null || true
+    rm -f "$KEYDIR/ssh_host_key" 2>/dev/null || true
+
+    if [ -f "$KEYDIR/sshd_config" ]; then
+        sed -i 's|^HostKey /etc/ssh/ssh_host_key|#HostKey /etc/ssh/ssh_host_key|g' "$KEYDIR/sshd_config" 2>/dev/null || true
+    fi
+
+    if [ -f /usr/libexec/sshd-keygen-wrapper ]; then
+        cat << 'EOF' > /usr/libexec/sshd-keygen-wrapper
+#!/bin/sh
+exec /usr/sbin/sshd "$@"
+EOF
+        chmod 0755 /usr/libexec/sshd-keygen-wrapper
+    fi
+fi
+
+if [ -d "$KEYDIR" ]; then
+    if uses_published_key; then
+        if regenerate_host_keys; then
+            SSH_WARNING="SSH host keys were replaced: the old ones were public. Your SSH client will report a changed host key once; that is expected."
+        else
+            SSH_WARNING="WARNING: this device still uses SSH host keys that are public, and new ones could not be generated here. Generate keys on a computer and copy them to /etc/ssh."
+        fi
+    elif ! is_arm64 && ! has_host_key; then
+        # No keys yet on a 32-bit device: make them now so the first connection does not hang.
+        regenerate_host_keys || SSH_WARNING="WARNING: could not generate SSH host keys; SSH will not accept connections until /etc/ssh has host keys."
+    fi
+fi
+rm -rf /var/mobile/.relay_keys 2>/dev/null || true
+
+if ! is_arm64 && [ -x /usr/sbin/sshd ]; then
+    /usr/sbin/sshd 2>/dev/null || true
+fi
+
+# The openssh/openssl packages in this repository are 32-bit builds for iOS 10.
+if is_arm64; then
+    case "$(dpkg-query -W -f='${Version}' openssh 2>/dev/null)" in
+        6.7p1-13*)
+            SSH_WARNING="$SSH_WARNING WARNING: the installed openssh 6.7p1-13 is a 32-bit build and cannot run on this device. Install openssh from your jailbreak's own repository."
+            ;;
+    esac
+fi
+
+# --- relay daemon ----------------------------------------------------------------------
+chmod 0755 /var/mobile/relayserver
+chmod 0755 /var/mobile/bin_variants/* 2>/dev/null || true
+chown mobile:mobile /var/mobile/relayserver 2>/dev/null || true
+chown -R mobile:mobile /var/mobile/bin_variants 2>/dev/null || true
+
+# Optional fallback builds: when the package carries bin_variants/, relayserver_abs is the
+# one that runs.
+if [ -f /var/mobile/bin_variants/relayserver_abs ]; then
+    cp -f /var/mobile/bin_variants/relayserver_abs /var/mobile/relayserver
+    chmod 0755 /var/mobile/relayserver
+    chown mobile:mobile /var/mobile/relayserver 2>/dev/null || true
+fi
+
+> /var/mobile/relayserver.log
+> /var/mobile/relayserver.err
+
+launchctl unload /Library/LaunchDaemons/dev.copper.relayserver.plist 2>/dev/null || true
+chmod 0644 /Library/LaunchDaemons/dev.copper.relayserver.plist
+chown root:wheel /Library/LaunchDaemons/dev.copper.relayserver.plist 2>/dev/null || true
+launchctl load -w /Library/LaunchDaemons/dev.copper.relayserver.plist 2>&1 || true
+
+sleep 2
+
+# Automatic IP and Hostname Detection
+IP=$(ipconfig getifaddr en0 2>/dev/null)
+if [ -z "$IP" ]; then
+    IP=$(ifconfig en0 2>/dev/null | grep 'inet ' | head -n1 | awk '{print $2}')
+fi
+HOST=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo "iPhone")
+
+echo "=========================================="
+echo "    RELAYSERVER @@VERSION@@ INSTALLED!"
+echo "=========================================="
+if [ -n "$IP" ]; then
+    echo "  Web Dashboard:  http://${IP}:8080/"
+    echo "  Settings (HA):  http://${IP}:8080/ha"
+    echo "  mDNS Address:   http://${HOST}.local:8080/"
+else
+    echo "  Web Dashboard:  http://${HOST}.local:8080/"
+    echo "  (Connect to Wi-Fi to access from your PC)"
+fi
+echo "  On-Device:      http://localhost:8080/"
+echo "=========================================="
+if [ -n "$SSH_WARNING" ]; then
+    echo "$SSH_WARNING"
+    echo "=========================================="
 fi
 exit 0

@@ -65,6 +65,24 @@ Add the community repository to your package manager of choice:
 
 ---
 
+## Packaging
+
+`relay-package/build-deb.sh` builds the `.deb` that the APT repository serves:
+
+```bash
+relay-package/build-deb.sh <version> <signed-armv7s-binary> <signed-arm64-binary> [output-dir]
+```
+
+- **One universal package.** The script merges the `armv7s` build from this repository and the `arm64` build from [`relayserver-arm64`](https://github.com/Bananz0/relayserver-arm64) into a single fat binary. A rootful jailbreak reports the dpkg architecture `iphoneos-arm` on 64-bit phones too, so an `armv7s`-only package gets installed there and cannot run.
+- **Inputs must already be signed** with `ldid -S<entitlements>`; the script checks this and does not modify the binaries.
+- **No SSH host keys in the package.** Releases 0.0.6 – 0.0.16-1 shipped host keys, which made them public. `postinst` now recognises those keys (their public halves are listed in `relay-package/published-hostkeys.txt`) and replaces them with keys generated on the device. The build fails if a private key ends up in the package.
+- **32-bit workarounds are gated.** Root filesystem stashing and the `sshd-keygen-wrapper` replacement only run on 32-bit devices.
+- `EXTRA_DIR=<dir>` copies additional payload (for example `var/mobile/bin_variants/`) over the package root.
+
+The package layout lives in `relay-package/layout/`; `@@VERSION@@` and `@@PUBLISHED_KEYS@@` are filled in at build time.
+
+---
+
 ## Credits & Upstream Links
 
 - **Upstream OpenBubbles:** [github.com/OpenBubbles/relayserver](https://github.com/OpenBubbles/relayserver)
