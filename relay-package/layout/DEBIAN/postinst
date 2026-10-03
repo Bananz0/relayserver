@@ -208,14 +208,32 @@ fi
 
 # 64-bit iOS 12 jailbreaks: launchd cannot spawn a daemon whose binary lives on the data
 # partition (/var), even though it runs fine from a shell; the job just reports status 78.
-# Put a real copy on the root filesystem and point the job at it.
+# Put real copies on the root filesystem and point the jobs at them.
 if is_arm64; then
-    rm -f /usr/local/bin/relayserver
-    cp -f /var/mobile/relayserver /usr/local/bin/relayserver
-    chmod 0755 /usr/local/bin/relayserver
-    chown root:wheel /usr/local/bin/relayserver 2>/dev/null || true
+    for bin in relayserver relay-chargelimit; do
+        [ -f /var/mobile/$bin ] || continue
+        rm -f /usr/local/bin/$bin
+        cp -f /var/mobile/$bin /usr/local/bin/$bin
+        chmod 0755 /usr/local/bin/$bin
+        chown root:wheel /usr/local/bin/$bin 2>/dev/null || true
+    done
     sed -i 's|<string>/var/mobile/relayserver</string>|<string>/usr/local/bin/relayserver</string>|g' \
         /Library/LaunchDaemons/dev.copper.relayserver.plist
+    sed -i 's|<string>/var/mobile/relay-chargelimit</string>|<string>/usr/local/bin/relay-chargelimit</string>|g' \
+        /Library/LaunchDaemons/dev.copper.chargelimit.plist
+fi
+
+# Charge limiter: holds the battery between min and max while plugged in. The settings
+# file is created once and never overwritten, so local changes survive upgrades.
+if [ ! -f /var/mobile/chargelimit.conf ]; then
+    printf 'enabled=1\nmax=80\nmin=70\n' > /var/mobile/chargelimit.conf
+    chown mobile:mobile /var/mobile/chargelimit.conf 2>/dev/null || true
+fi
+if [ -f /Library/LaunchDaemons/dev.copper.chargelimit.plist ]; then
+    chmod 0644 /Library/LaunchDaemons/dev.copper.chargelimit.plist
+    chown root:wheel /Library/LaunchDaemons/dev.copper.chargelimit.plist 2>/dev/null || true
+    launchctl unload /Library/LaunchDaemons/dev.copper.chargelimit.plist 2>/dev/null || true
+    launchctl load -w /Library/LaunchDaemons/dev.copper.chargelimit.plist 2>&1 || true
 fi
 
 launchctl unload /Library/LaunchDaemons/dev.copper.relayserver.plist 2>/dev/null || true

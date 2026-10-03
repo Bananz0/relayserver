@@ -78,7 +78,7 @@ PY
 
 find "$STAGE" -type d -exec chmod 0755 {} +
 chmod 0755 "$STAGE/DEBIAN/preinst" "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm"
-chmod 0644 "$STAGE/DEBIAN/control" "$STAGE/Library/LaunchDaemons/dev.copper.relayserver.plist"
+chmod 0644 "$STAGE/DEBIAN/control" "$STAGE"/Library/LaunchDaemons/*.plist
 
 if grep -rIl "PRIVATE KEY" "$STAGE" > /dev/null; then
     echo "refusing to build: the package contains a private key" >&2
