@@ -41,6 +41,11 @@ check_slice() {
         || { echo "$file is not a thin $want binary" >&2; exit 1; }
     "$LDID" -e "$file" | grep -q "<plist" \
         || { echo "$file is not signed with entitlements (run ldid -S<entitlements> first)" >&2; exit 1; }
+    # iOS 12 rejects entitlements with CRLF line endings and SIGKILLs the process at launch.
+    if "$LDID" -e "$file" | grep -q $'\r'; then
+        echo "$file was signed with CRLF entitlements; re-sign with an LF Entitlements.xml" >&2
+        exit 1
+    fi
 }
 check_slice "$ARMV7S_BIN" armv7s
 check_slice "$ARM64_BIN" arm64

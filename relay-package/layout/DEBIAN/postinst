@@ -18,6 +18,7 @@ is_arm64() {
 KEYDIR=/etc/ssh
 KEYGEN_TIMEOUT=60
 SSH_WARNING=""
+KEYS_CHANGED=""
 
 is_published_key() {
     grep -qxF "$1" << 'PUBLISHED_KEYS'
@@ -95,8 +96,9 @@ regenerate_host_keys() {
 
 if ! is_arm64; then
     # 32-bit / iOS 10 OpenSSH workarounds: the stock keygen wrapper tries to create a legacy
-    # rsa1 key on every connection and hangs, which freezes SSH.
-    killall -9 sshd ssh-keygen 2>/dev/null || true
+    # rsa1 key on every connection and hangs, which freezes SSH. sshd itself is left running so
+    # an install over SSH does not cut its own session.
+    killall -9 ssh-keygen 2>/dev/null || true
     mkdir -p "$KEYDIR" /var/empty
     chmod 0755 /var/empty 2>/dev/null || true
     chown root:sys /var/empty 2>/dev/null || true
@@ -118,19 +120,64 @@ fi
 if [ -d "$KEYDIR" ]; then
     if uses_published_key; then
         if regenerate_host_keys; then
+            KEYS_CHANGED=1
             SSH_WARNING="SSH host keys were replaced: the old ones were public. Your SSH client will report a changed host key once; that is expected."
         else
             SSH_WARNING="WARNING: this device still uses SSH host keys that are public, and new ones could not be generated here. Generate keys on a computer and copy them to /etc/ssh."
         fi
     elif ! is_arm64 && ! has_host_key; then
         # No keys yet on a 32-bit device: make them now so the first connection does not hang.
-        regenerate_host_keys || SSH_WARNING="WARNING: could not generate SSH host keys; SSH will not accept connections until /etc/ssh has host keys."
+        regenerate_host_keys && KEYS_CHANGED=1 || SSH_WARNING="WARNING: could not generate SSH host keys; SSH will not accept connections until /etc/ssh has host keys."
     fi
 fi
 rm -rf /var/mobile/.relay_keys 2>/dev/null || true
 
+# 32-bit: the stock com.openssh.sshd job is socket-activated, and on h3lix/iOS 10 launchd
+# accepts connections on port 22 without ever starting sshd, so SSH hangs before the banner.
+# Run sshd as a normal daemon instead, and point sshd_config at the keys that exist.
+SOCKET_JOB=/Library/LaunchDaemons/com.openssh.sshd.plist
+SSHD_JOB=/Library/LaunchDaemons/dev.copper.sshd.plist
 if ! is_arm64 && [ -x /usr/sbin/sshd ]; then
-    /usr/sbin/sshd 2>/dev/null || true
+    CONFIG="$KEYDIR/sshd_config"
+    if [ -f "$CONFIG" ] && [ ! -f "$KEYDIR/ssh_host_dsa_key" ] \
+        && grep -q '^HostKey /etc/ssh/ssh_host_dsa_key' "$CONFIG" \
+        && [ -f "$KEYDIR/ssh_host_ecdsa_key" ] && [ -f "$KEYDIR/ssh_host_ed25519_key" ]; then
+        cp -p "$CONFIG" "$CONFIG.relay-bak"
+        sed -i 's|^HostKey /etc/ssh/ssh_host_dsa_key|HostKey /etc/ssh/ssh_host_ecdsa_key\
+HostKey /etc/ssh/ssh_host_ed25519_key|' "$CONFIG"
+        /usr/sbin/sshd -t 2>/dev/null || mv -f "$CONFIG.relay-bak" "$CONFIG"
+        rm -f "$CONFIG.relay-bak"
+    fi
+
+    if [ ! -f "$SSHD_JOB" ]; then
+        cat << 'EOF' > "$SSHD_JOB"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.copper.sshd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/sbin/sshd</string>
+        <string>-D</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+        chmod 0644 "$SSHD_JOB"
+        chown root:wheel "$SSHD_JOB" 2>/dev/null || true
+        [ -f "$SOCKET_JOB" ] && launchctl unload -w "$SOCKET_JOB" 2>/dev/null
+        launchctl load -w "$SSHD_JOB" 2>/dev/null || true
+    elif [ -n "$KEYS_CHANGED" ]; then
+        # Restart only the listening daemon so it serves the new keys; open sessions stay up.
+        launchctl unload "$SSHD_JOB" 2>/dev/null
+        launchctl load -w "$SSHD_JOB" 2>/dev/null || true
+    fi
 fi
 
 # The openssh/openssl packages in this repository are 32-bit builds for iOS 10.
@@ -158,6 +205,18 @@ fi
 
 > /var/mobile/relayserver.log
 > /var/mobile/relayserver.err
+
+# 64-bit iOS 12 jailbreaks: launchd cannot spawn a daemon whose binary lives on the data
+# partition (/var), even though it runs fine from a shell; the job just reports status 78.
+# Put a real copy on the root filesystem and point the job at it.
+if is_arm64; then
+    rm -f /usr/local/bin/relayserver
+    cp -f /var/mobile/relayserver /usr/local/bin/relayserver
+    chmod 0755 /usr/local/bin/relayserver
+    chown root:wheel /usr/local/bin/relayserver 2>/dev/null || true
+    sed -i 's|<string>/var/mobile/relayserver</string>|<string>/usr/local/bin/relayserver</string>|g' \
+        /Library/LaunchDaemons/dev.copper.relayserver.plist
+fi
 
 launchctl unload /Library/LaunchDaemons/dev.copper.relayserver.plist 2>/dev/null || true
 chmod 0644 /Library/LaunchDaemons/dev.copper.relayserver.plist
