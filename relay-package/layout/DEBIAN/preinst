@@ -1,5 +1,33 @@
 #!/bin/sh
-if [ -f /Library/LaunchDaemons/dev.copper.relayserver.plist ]; then
-    launchctl unload /Library/LaunchDaemons/dev.copper.relayserver.plist 2>/dev/null || true
+set -e
+killall -9 relayserver 2>/dev/null || true
+
+is_arm64() {
+    case "$(uname -v 2>/dev/null)" in
+        *ARM64*) return 0 ;;
+    esac
+    [ "$(sysctl -n hw.cpu64bit_capable 2>/dev/null)" = "1" ]
+}
+
+# 32-bit devices (iPhone 5/5c, iPad 4 on iOS 10) have a very small system partition, so
+# /Library/Wallpaper and /usr/local are stashed on /var. 64-bit devices have the room and
+# their root filesystem is left alone.
+if ! is_arm64; then
+    if [ -d /Library/Wallpaper ] && [ ! -L /Library/Wallpaper ]; then
+        mkdir -p /var/stash_storage/Wallpaper
+        cp -af /Library/Wallpaper/* /var/stash_storage/Wallpaper/ 2>/dev/null || true
+        rm -rf /Library/Wallpaper
+        ln -sf /var/stash_storage/Wallpaper /Library/Wallpaper
+    fi
+    if [ ! -L /usr/local ]; then
+        mkdir -p /var/local
+        if [ -d /usr/local ]; then
+            cp -af /usr/local/* /var/local/ 2>/dev/null || true
+            rm -rf /usr/local
+        fi
+        ln -sf /var/local /usr/local
+    fi
 fi
+mkdir -p /var/mobile
+mkdir -p /usr/local/bin
 exit 0

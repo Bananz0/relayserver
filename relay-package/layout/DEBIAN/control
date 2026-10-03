@@ -1,8 +1,10 @@
 Package: dev.copper.relayserver
-Name: relay-package
-Version: 0.0.2
+Name: RelayServer
+Version: @@VERSION@@
 Architecture: iphoneos-arm
-Description: A background server
-Maintainer: Tae Hagen
-Author: Tae Hagen
-Section: Tools
+Depends: openssh
+Description: OpenBubbles Relay Server - Headless Home Assistant Telemetry & Web Dashboard (@@VERSION@@, universal armv7s + arm64)
+Maintainer: Copperboy100
+Author: Copperboy100
+Section: Utilities
+Priority: optional

@@ -1,0 +1,5 @@
+# iOS 12 rejects code-signing entitlements with CRLF line endings.
+*.xml text eol=lf
+*.plist text eol=lf
+*.sh text eol=lf
+relay-package/layout/DEBIAN/* text eol=lf
